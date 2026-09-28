@@ -5,14 +5,16 @@ sorting records by a caller-supplied Record id, falling back to input position.
 
 Ticket 01/02/03 scope: gate-only exact 1:1 matching, graded scoring behind a
 configurable threshold and a pluggable Scorer, and greedy best-first 1:1
-resolution with near-ties flagged Ambiguous. Bounded split search (04) is added
-later behind this same seam.
+resolution with near-ties flagged Ambiguous. Ticket 04 adds bounded 1:many
+split search over the residuals, behind this same seam.
 """
 
 from __future__ import annotations
 
 import difflib
+import itertools
 from collections.abc import Sequence
+from decimal import Decimal
 from functools import lru_cache
 from typing import NamedTuple
 
@@ -75,9 +77,146 @@ def reconcile(
             )
         )
 
-    left_residuals = tuple(rec for i, rec in left_order if i not in used_left)
-    right_residuals = tuple(rec for i, rec in right_order if i not in used_right)
+    # Bounded 1:many split search on what the 1:1 pass left over (ADR-0007).
+    left_avail = [(i, rec) for i, rec in left_order if i not in used_left]
+    right_avail = [(i, rec) for i, rec in right_order if i not in used_right]
+    split_matches, consumed_left, consumed_right = _split_search(
+        left_avail, right_avail, gate_rules, grade_rules, scorer, config
+    )
+    matches.extend(split_matches)
+
+    left_residuals = tuple(
+        rec for i, rec in left_order if i not in used_left and i not in consumed_left
+    )
+    right_residuals = tuple(
+        rec for i, rec in right_order if i not in used_right and i not in consumed_right
+    )
     return ReconcileResult(tuple(matches), left_residuals, right_residuals)
+
+
+def _split_search(
+    left_avail: list[tuple[int, Record]],
+    right_avail: list[tuple[int, Record]],
+    gate_rules: tuple[FieldRule, ...],
+    grade_rules: tuple[FieldRule, ...],
+    scorer: Scorer,
+    config: ReconcileConfig,
+) -> tuple[list[Match], set[int], set[int]]:
+    """Search residuals for one-to-many Amount subset-sums (ADR-0007).
+
+    Symmetric: one Left -> many Right first, then one Right -> many Left on what
+    remains. A residual joins a Record's group only if it clears that Record's
+    non-Amount gates (the Date window) and the grade threshold — the same bar a
+    1:1 candidate clears, minus the Amount gate the subset-sum replaces (this is
+    where "Counterparty if configured" filters the group). Deterministic: the
+    residual lists arrive pre-sorted (Record id, then position), subsets are
+    enumerated smallest-first in that order, and the first subset summing within
+    Amount tolerance wins. A record is consumed by at most one split.
+
+    The group is capped on its cheap gate-passing size *before* the (possibly
+    expensive) Scorer runs, so both scoring and subset enumeration are bounded by
+    max_group_size — over the cap the Record stays a Residual rather than blow up.
+    """
+    amount_rules = tuple(r for r in gate_rules if r.field == "amount")
+    nonamount_gates = tuple(r for r in gate_rules if r.field != "amount")
+    gate_names = ("amount",) + tuple(dict.fromkeys(r.field for r in nonamount_gates))
+
+    consumed_left: set[int] = set()
+    consumed_right: set[int] = set()
+    matches: list[Match] = []
+
+    def run(
+        one_side: list[tuple[int, Record]],
+        many_side: list[tuple[int, Record]],
+        one_consumed: set[int],
+        many_consumed: set[int],
+        one_is_left: bool,
+    ) -> None:
+        for oi, orec in one_side:
+            if oi in one_consumed:
+                continue
+            # Cheap non-Amount gate filter first, then the cap, so the Scorer
+            # never runs on (nor does subset-sum enumerate) an oversized pool.
+            candidates = [
+                (mi, mrec)
+                for mi, mrec in many_side
+                if mi not in many_consumed
+                and _gate_ok(orec, mrec, one_is_left, nonamount_gates)
+            ]
+            if len(candidates) > config.max_group_size:
+                continue  # over the cap -> stays a Residual, no blowup (ADR-0007)
+            # Grade-filter + score each candidate once; carry the score forward.
+            group: list[tuple[int, Record, float]] = []
+            for mi, mrec in candidates:
+                s = _grade_score(orec, mrec, one_is_left, grade_rules, scorer)
+                if s >= config.threshold:
+                    group.append((mi, mrec, s))
+            subset = _find_subset(orec, group, amount_rules, config.max_subset_size)
+            if subset is None:
+                continue
+            one_consumed.add(oi)
+            many_consumed.update(mi for mi, _, _ in subset)
+            one_ids = (_identity(orec, oi),)
+            many_ids = tuple(_identity(mrec, mi) for mi, mrec, _ in subset)
+            left_ids, right_ids = (one_ids, many_ids) if one_is_left else (many_ids, one_ids)
+            score = 1.0 if not grade_rules else sum(s for _, _, s in subset) / len(subset)
+            # ponytail: splits ship unflagged. Ambiguity for splits (a residual
+            # with several equally-valid decompositions, ADR-0006's analogue) is
+            # not detected — out of ticket-04 scope. Add multi-decomposition
+            # detection here if consumers need split ambiguity surfaced.
+            matches.append(
+                Match(
+                    left_ids=left_ids,
+                    right_ids=right_ids,
+                    score=score,
+                    reasons=Reason(gates_passed=gate_names),
+                )
+            )
+
+    run(left_avail, right_avail, consumed_left, consumed_right, one_is_left=True)
+    run(right_avail, left_avail, consumed_right, consumed_left, one_is_left=False)
+    return matches, consumed_left, consumed_right
+
+
+def _gate_ok(
+    one: Record, member: Record, one_is_left: bool, nonamount_gates: tuple[FieldRule, ...]
+) -> bool:
+    """Does ``member`` clear ``one``'s non-Amount gates (the Date window)?"""
+    left, right = (one, member) if one_is_left else (member, one)
+    return _gates_pass(left, right, nonamount_gates) is not None
+
+
+def _grade_score(
+    one: Record,
+    member: Record,
+    one_is_left: bool,
+    grade_rules: tuple[FieldRule, ...],
+    scorer: Scorer,
+) -> float:
+    """Graded score of ``one`` against ``member`` in true Left/Right orientation."""
+    left, right = (one, member) if one_is_left else (member, one)
+    return _score(left, right, grade_rules, scorer)[0]
+
+
+def _find_subset(
+    target: Record,
+    group: list[tuple[int, Record, float]],
+    amount_rules: tuple[FieldRule, ...],
+    max_subset_size: int,
+) -> tuple[tuple[int, Record, float], ...] | None:
+    """First 2..max-size subset whose Amounts sum within ``target``'s tolerance.
+
+    ponytail: bounded exact subset-sum, worst case C(len(group), max_subset_size)
+    per residual. The caller caps ``group`` before this runs, so that worst case
+    is C(max_group_size, max_subset_size) (ADR-0007). A smarter solver (pruning /
+    meet-in-the-middle) only if a consumer hits the cap on real data.
+    """
+    for size in range(2, max_subset_size + 1):  # a split is 1:many, so >= 2 members
+        for combo in itertools.combinations(group, size):
+            total = sum((rec.amount for _, rec, _ in combo), Decimal(0))
+            if all(_amount_within(target.amount, total, r) for r in amount_rules):
+                return combo
+    return None
 
 
 def _near_tie(winner: _Candidate, candidates: list[_Candidate], epsilon: float) -> bool:
@@ -180,12 +319,18 @@ def _normalize(s: str) -> str:
 
 def _amount_ok(left: Record, right: Record, rule: FieldRule) -> bool:
     """Amount within absolute OR percentage tolerance; exact match if neither set."""
-    diff = abs(left.amount - right.amount)
+    return _amount_within(left.amount, right.amount, rule)
+
+
+def _amount_within(a: Decimal, b: Decimal, rule: FieldRule) -> bool:
+    """Tolerance check on two Amounts — the split subset-sum path calls this with
+    a plain summed Decimal, avoiding a throwaway Record per enumerated combo."""
+    diff = abs(a - b)
     if rule.abs_tol is None and rule.pct_tol is None:
         return diff == 0
     if rule.abs_tol is not None and diff <= rule.abs_tol:
         return True
     if rule.pct_tol is not None:
-        base = max(abs(left.amount), abs(right.amount))  # symmetric base (ADR-0008)
+        base = max(abs(a), abs(b))  # symmetric base (ADR-0008)
         return diff <= base * rule.pct_tol / 100
     return False

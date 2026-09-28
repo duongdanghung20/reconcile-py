@@ -54,7 +54,11 @@ class ReconcileConfig:
     threshold: float = 1.0
     ambiguity_epsilon: float = 0.0
     max_subset_size: int = 4
-    max_group_size: int = 100
+    # Split search enumerates C(max_group_size, max_subset_size) subsets per
+    # residual in the worst case (ADR-0007). The default keeps that bound small
+    # (C(16, 4) == 1820); raise it only when real batches exceed a 16-candidate
+    # group and the cost is acceptable.
+    max_group_size: int = 16
     scorer: Optional[Scorer] = None
 
     def __post_init__(self) -> None:
@@ -84,6 +88,15 @@ class ReconcileConfig:
         # core safety feature): abs(score diff) is never <= a negative number.
         if self.ambiguity_epsilon < 0:
             raise ValueError("ambiguity_epsilon must be >= 0")
+        # A split has at least two members; < 2 would make range(2, size+1) empty
+        # and silently skip every split (ADR-0007), the same silent-misconfig
+        # failure the guards above prevent.
+        if self.max_subset_size < 2:
+            raise ValueError("max_subset_size must be >= 2 (a split has at least two members)")
+        # A non-positive group cap makes len(group) > cap always true, silently
+        # disabling split search for every input.
+        if self.max_group_size < 1:
+            raise ValueError("max_group_size must be >= 1")
 
 
 @dataclass(frozen=True)
