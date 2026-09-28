@@ -1,0 +1,5 @@
+# Split matches are discovered after the 1:1 pass, with bounded subset-sum
+
+One-to-many (split) matches are searched only after the 1:1 pass leaves residuals. For a residual record, the engine groups opposite-side residuals that pass its gates (Date window, Counterparty if configured), then searches subsets whose Amount sums within tolerance of the residual's Amount. The search is bounded by a configurable max subset size (default 4) and a max group size above which split search is skipped — the record stays a Residual rather than triggering exponential blowup. Split search runs symmetrically in both directions.
+
+We chose bounded exact subset-sum after 1:1, rather than searching splits and singletons together, because subset-sum is exponential and the gates collapse it to small groups only once the easy 1:1 matches are removed. The bound is a deliberate correctness-for-termination trade: on pathological inputs some legitimate splits go undiscovered instead of hanging. A smarter solver is warranted only if a consumer hits the cap on real data.
