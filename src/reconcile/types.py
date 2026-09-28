@@ -65,9 +65,19 @@ class ReconcileConfig:
             # would otherwise be silently ignored by the engine.
             if r.role == "gate" and r.field not in ("amount", "date"):
                 raise ValueError(f"{r.field!r} cannot be a gate field (only amount, date)")
+            # ...and only Reference/Counterparty can be graded (ADR-0003); grading
+            # amount/date would crash in the string Scorer instead of here.
+            if r.role == "grade" and r.field not in ("reference", "counterparty"):
+                raise ValueError(
+                    f"{r.field!r} cannot be a graded field (only reference, counterparty)"
+                )
             # A date gate with no window would silently reject every pair.
             if r.field == "date" and r.role == "gate" and r.day_tol is None:
                 raise ValueError("date gate rule requires day_tol")
+            # Non-positive weight breaks the weighted mean: zero sum bypasses the
+            # threshold, negative pushes the score outside 0..1.
+            if r.role == "grade" and r.weight is not None and r.weight <= 0:
+                raise ValueError(f"graded field {r.field!r} weight must be positive")
         if not any(r.field == "amount" and r.role == "gate" for r in self.rules):
             raise ValueError("ReconcileConfig requires an Amount gate rule")
 
