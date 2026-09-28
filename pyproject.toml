@@ -9,6 +9,10 @@ description = "Deterministic, explainable fuzzy reconciliation of financial reco
 readme = "README.md"
 requires-python = ">=3.10"
 
+[project.optional-dependencies]
+# The pandas adapter (reconcile.pandas_adapter) only; the core engine needs none.
+pandas = ["pandas>=2.0"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
