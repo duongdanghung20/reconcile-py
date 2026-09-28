@@ -4,14 +4,14 @@
 
 **Blocked by:** 01
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Reference and Counterparty can be configured as graded fields with per-field weights.
-- [ ] Default Scorer computes Similarity (0..1) by normalizing strings (case-fold, strip punctuation/whitespace) and using `difflib.SequenceMatcher`; no non-stdlib dependency (ADR-0005).
-- [ ] Match score is the weighted mean of graded-field Similarities; weights configurable, equal by default.
-- [ ] A candidate matches only when it passes all gates AND `score ≥ threshold`.
-- [ ] Gate-only config (no graded fields) still yields score 1.0 (regression on T01 behavior).
-- [ ] A caller-supplied Scorer can be injected via `ReconcileConfig` and changes matching outcomes.
-- [ ] Each Match reason records every graded field's Similarity alongside the gate passes.
-- [ ] Amount stays a hard gate: a pair with a perfect Reference/Counterparty but Amount outside tolerance does not match (ADR-0003).
-- [ ] Tests through the `reconcile()` seam cover: scoring, weight effect, threshold boundary, string normalization, custom-scorer injection. Determinism holds.
+- [x] Reference and Counterparty can be configured as graded fields with per-field weights.
+- [x] Default Scorer computes Similarity (0..1) by normalizing strings (case-fold, strip punctuation/whitespace) and using `difflib.SequenceMatcher`; no non-stdlib dependency (ADR-0005).
+- [x] Match score is the weighted mean of graded-field Similarities; weights configurable, equal by default.
+- [x] A candidate matches only when it passes all gates AND `score ≥ threshold`.
+- [x] Gate-only config (no graded fields) still yields score 1.0 (regression on T01 behavior).
+- [x] A caller-supplied Scorer can be injected via `ReconcileConfig` and changes matching outcomes.
+- [x] Each Match reason records every graded field's Similarity alongside the gate passes.
+- [x] Amount stays a hard gate: a pair with a perfect Reference/Counterparty but Amount outside tolerance does not match (ADR-0003).
+- [x] Tests through the `reconcile()` seam cover: scoring, weight effect, threshold boundary, string normalization, custom-scorer injection. Determinism holds.
