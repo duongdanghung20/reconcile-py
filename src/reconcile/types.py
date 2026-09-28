@@ -80,6 +80,10 @@ class ReconcileConfig:
                 raise ValueError(f"graded field {r.field!r} weight must be positive")
         if not any(r.field == "amount" and r.role == "gate" for r in self.rules):
             raise ValueError("ReconcileConfig requires an Amount gate rule")
+        # A negative epsilon silently disables all near-tie flagging (ADR-0006's
+        # core safety feature): abs(score diff) is never <= a negative number.
+        if self.ambiguity_epsilon < 0:
+            raise ValueError("ambiguity_epsilon must be >= 0")
 
 
 @dataclass(frozen=True)

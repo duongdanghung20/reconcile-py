@@ -3,10 +3,10 @@
 Pure: no wall-clock, no randomness, no IO (ADR-0004). Determinism comes from
 sorting records by a caller-supplied Record id, falling back to input position.
 
-Ticket 01/02 scope: gate-only exact 1:1 matching, plus graded scoring behind a
-configurable threshold and a pluggable Scorer. Greedy best-first resolution (03)
-and bounded split search (04) are added later behind this same seam; here a
-candidate is claimed first-fit in deterministic order once it clears threshold.
+Ticket 01/02/03 scope: gate-only exact 1:1 matching, graded scoring behind a
+configurable threshold and a pluggable Scorer, and greedy best-first 1:1
+resolution with near-ties flagged Ambiguous. Bounded split search (04) is added
+later behind this same seam.
 """
 
 from __future__ import annotations
@@ -14,8 +14,21 @@ from __future__ import annotations
 import difflib
 from collections.abc import Sequence
 from functools import lru_cache
+from typing import NamedTuple
 
 from .types import FieldRule, Match, Reason, ReconcileConfig, ReconcileResult, Record, Scorer
+
+
+class _Candidate(NamedTuple):
+    """A pair that cleared gates and threshold, awaiting greedy resolution."""
+
+    score: float
+    li: int  # left input position
+    ri: int  # right input position
+    lrec: Record
+    rrec: Record
+    gates_passed: tuple[str, ...]
+    similarities: tuple[tuple[str, float], ...]
 
 
 def reconcile(
@@ -29,35 +42,62 @@ def reconcile(
     left_order = _ordered(left)
     right_order = _ordered(right)
 
-    used_right: set[int] = set()
-    matched_left: set[int] = set()
-    matches: list[Match] = []
-
+    candidates: list[_Candidate] = []
     for li, lrec in left_order:
         for ri, rrec in right_order:
-            if ri in used_right:
-                continue
             gates_passed = _gates_pass(lrec, rrec, gate_rules)
             if gates_passed is None:
                 continue
             score, similarities = _score(lrec, rrec, grade_rules, scorer)
             if score < config.threshold:
-                continue  # passes gates but not the threshold; right stays free
-            used_right.add(ri)
-            matched_left.add(li)
-            matches.append(
-                Match(
-                    left_ids=(_identity(lrec, li),),
-                    right_ids=(_identity(rrec, ri),),
-                    score=score,
-                    reasons=Reason(gates_passed=gates_passed, similarities=similarities),
-                )
-            )
-            break  # 1:1 — each record consumed once
+                continue  # passes gates but not the threshold
+            candidates.append(_Candidate(score, li, ri, lrec, rrec, gates_passed, similarities))
 
-    left_residuals = tuple(rec for i, rec in left_order if i not in matched_left)
+    # Best-first, ties broken by Record id then input position (ADR-0004, 0006).
+    candidates.sort(key=lambda c: (-c.score, _sort_key(c.lrec, c.li), _sort_key(c.rrec, c.ri)))
+
+    used_left: set[int] = set()
+    used_right: set[int] = set()
+    matches: list[Match] = []
+    for cand in candidates:
+        if cand.li in used_left or cand.ri in used_right:
+            continue  # a record is consumed by at most one Match
+        ambiguous = _near_tie(cand, candidates, config.ambiguity_epsilon)
+        used_left.add(cand.li)
+        used_right.add(cand.ri)
+        matches.append(
+            Match(
+                left_ids=(_identity(cand.lrec, cand.li),),
+                right_ids=(_identity(cand.rrec, cand.ri),),
+                score=cand.score,
+                reasons=Reason(gates_passed=cand.gates_passed, similarities=cand.similarities),
+                ambiguous=ambiguous,
+            )
+        )
+
+    left_residuals = tuple(rec for i, rec in left_order if i not in used_left)
     right_residuals = tuple(rec for i, rec in right_order if i not in used_right)
     return ReconcileResult(tuple(matches), left_residuals, right_residuals)
+
+
+def _near_tie(winner: _Candidate, candidates: list[_Candidate], epsilon: float) -> bool:
+    """True when a Record the winner claims had a competing candidate within epsilon.
+
+    A competitor shares exactly one endpoint with the winner (a different record
+    on the other side). We compare against every such candidate, not only those
+    still free: a Record contested by a near-equal alternative is uncertain even
+    when that alternative's other side was claimed by a stronger match — the
+    "top two competing candidate scores for a Record" of ADR-0006 / CONTEXT.md.
+    """
+    # ponytail: O(candidates) per winner (O(candidates * min(L,R)) total). Index
+    # by endpoint if the all-pairs-pass worst case ever shows up on real data.
+    for c in candidates:
+        if c is winner:
+            continue
+        shares_one = (c.li == winner.li) != (c.ri == winner.ri)
+        if shares_one and abs(winner.score - c.score) <= epsilon:
+            return True
+    return False
 
 
 def _ordered(recs: Sequence[Record]) -> list[tuple[int, Record]]:
